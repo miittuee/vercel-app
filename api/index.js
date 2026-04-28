@@ -1,62 +1,100 @@
 export const config = { runtime: "edge" };
 
+// Required env vars
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+const API_KEY = process.env.API_KEY;
 
-const STRIP_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "forwarded",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-port",
-]);
+// Only allow specific API routes
+const ALLOWED_PREFIXES = ["/vercel/"];
+
+// Only allow safe methods
+const ALLOWED_METHODS = new Set(["GET", "POST"]);
+
+// Max body size (1MB)
+const MAX_BODY_SIZE = 1 * 1024 * 1024;
 
 export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("TARGET_DOMAIN is not set", { status: 500 });
+  if (!TARGET_BASE || !API_KEY) {
+    return new Response("Server misconfigured", { status: 500 });
+  }
+
+  const url = new URL(req.url);
+
+  // 🔒 1. Authentication
+  const key = req.headers.get("x-api-key");
+  if (key !== API_KEY) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  // 🔒 2. Restrict path
+  if (!ALLOWED_PREFIXES.some(p => url.pathname.startsWith(p))) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  // 🔒 3. Restrict method
+  if (!ALLOWED_METHODS.has(req.method)) {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  // Build target URL safely
+  let targetUrl;
+  try {
+    targetUrl = new URL(url.pathname + url.search, TARGET_BASE);
+  } catch {
+    return new Response("Bad Request", { status: 400 });
   }
 
   try {
-    const pathStart = req.url.indexOf("/", 8);
-    const targetUrl =
-      pathStart === -1 ? TARGET_BASE + "/" : TARGET_BASE + req.url.slice(pathStart);
+    let body = undefined;
 
-    const out = new Headers();
-    let clientIp = null;
-    for (const [k, v] of req.headers) {
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = v;
-        continue;
+    // 🔒 4. Controlled body handling
+    if (req.method === "POST") {
+      const contentType = req.headers.get("content-type") || "";
+
+      if (!contentType.includes("application/json")) {
+        return new Response("Unsupported Media Type", { status: 415 });
       }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
-        continue;
+
+      const raw = await req.text();
+
+      if (raw.length > MAX_BODY_SIZE) {
+        return new Response("Payload too large", { status: 413 });
       }
-      out.set(k, v);
+
+      body = raw;
     }
-    if (clientIp) out.set("x-forwarded-for", clientIp);
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    // 🔒 5. Minimal, clean headers (no proxy impersonation)
+    const headers = new Headers();
+    headers.set("content-type", "application/json");
 
-    return await fetch(targetUrl, {
-      method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
-      duplex: "half",
-      redirect: "manual",
+    // Optional: pass user agent if present
+    const ua = req.headers.get("user-agent");
+    if (ua) headers.set("user-agent", ua);
+
+    // 🚀 6. Fetch to backend
+    const res = await fetch(targetUrl.toString(), {
+      method: req.method,
+      headers,
+      body,
+      redirect: "follow",
     });
+
+    // 🔒 7. Clean response
+    const responseHeaders = new Headers();
+    const contentType = res.headers.get("content-type");
+
+    if (contentType) {
+      responseHeaders.set("content-type", contentType);
+    }
+
+    return new Response(res.body, {
+      status: res.status,
+      headers: responseHeaders,
+    });
+
   } catch (err) {
     console.error("relay error:", err);
-    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
+    return new Response("Bad Gateway", { status: 502 });
   }
 }
