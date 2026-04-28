@@ -1,7 +1,7 @@
 {
-  "name": "vercel-xhttp-relay",
+  "name": "flower-shop-vercel",
   "version": "1.0.0",
-  "description": "Edge-runtime XHTTP relay for Xray/V2Ray on Vercel",
+  "description": "Edge-runtime XHTTP relay for my flower shop",
   "private": true,
   "license": "MIT"
 }
